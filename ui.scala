@@ -115,13 +115,12 @@ object App extends scala.swing.SwingApplication {
       case KeyPressed(src, Key.D | Key.Right, mods, loc) => scale.translate(-10,   0)
       case KeyPressed(src, Key.W | Key.Up,    mods, loc) => scale.translate(  0,  10)
       case KeyPressed(src, Key.S | Key.Down,  mods, loc) => scale.translate(  0, -10)
+      case KeyPressed(src, Key.Space, mods, loc) => paused = !paused
+      case KeyPressed(src, key, mods, loc) if key == Key.Plus  || key.id == 107 => speed *= 1.2 // integer id matches numpad +/-
+      case KeyPressed(src, key, mods, loc) if key == Key.Minus || key.id == 109 => speed /= 1.2
 
       case MouseMoved(src, point, mods) =>
         mousePoint = point
-        hoverOverPoint(scaleViewToModel(awtPointToJts(point))) match {
-          case Some((sh, blpos)) => hover = battleModel.ships(sh).ship.blocks(blpos)
-          case None              => hover = null
-        }
 
       case MouseDragged(src, point, mods) =>
         (mods & mouseButtons) match {
@@ -175,17 +174,22 @@ object App extends scala.swing.SwingApplication {
         selectionPath = null
     }
 
+    object UIState {
+    }
 
     @volatile var battleModel: BattleModel = BattleModel(Seq(
       ShipInBattle(ShipMaker._ship,     mkPoint( 200, 200),       0), 
       ShipInBattle(ShipMaker.enemyShip, mkPoint( 600, 200), math.Pi)
     ))
     @volatile var mousePoint = new Point(0, 0)
-    @volatile var hover: AnyRef = _ // tooltip
     @volatile var selectionStart: Point = _
     @volatile var selectionPath: java.awt.geom.GeneralPath = _
     @volatile var selectedBlocks: Set[(Int, (Int, Int))] = Set() // ship -> pos
     @volatile var zoom = 1.0
+
+    @volatile var speed = 1.0
+    @volatile var paused = false
+
     val scale = new AffineTransformation()
 
     def selectionRect = if (selectionStart == null) new Rectangle() else {
@@ -209,12 +213,17 @@ object App extends scala.swing.SwingApplication {
       } yield (idx, blpos))
 
 
-    makeHeartBeatThread(fps = 30) {
+    val targetFps = 30
+    makeHeartBeatThread(targetFps) {
       panel.repaint()
-      battleModel = battleModel.tick(10000)
+      if (!paused) {
+        val time = 1.0 / targetFps * speed
+        battleModel = battleModel.tick(time)
+      }
     }.start()
 
     override def paint(g: Graphics2D) {
+
       g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
 
       def draw(color: Color = null, stroke: Double = 1, shape: Shape): Unit = {
@@ -290,16 +299,19 @@ object App extends scala.swing.SwingApplication {
         g.setColor(Color.RED)
         val _pos = toAwtPoint(scaleModelToView(pos))
         drawCrosshair(g, _pos)
-        drawTooltip(g, s"$pos", _pos, true)
+        //drawTooltip(g, s"$pos", _pos, true)
       }
 
       // draw lazors
-      val lazors = for (((srcShipId, srcBlockPos), (destShipId, destBlockPos)) <- battleModel.targeting) yield {
-        val beam = battleModel.ships(srcShipId).ship.blocks(srcBlockPos).installation.asInstanceOf[Beam]
-        val src  = battleModel.ships(srcShipId).blockGeom(srcBlockPos).getCentroid
-        val dest = battleModel.ships(destShipId).blockGeom(destBlockPos).getCentroid
-        val line = mkLine(src, dest)
-        val lineToDraw = toAwtShape(scaleModelToView(line))
+      val lazors = for ((beamSrc @ (srcShipId, srcBlockPos), beamTarg @ (destShipId, destBlockPos)) <- battleModel.targeting) yield {
+        val beam = battleModel.shipBlock(beamSrc).installation.asInstanceOf[Beam]
+        val src  = battleModel.shipBlockGeom(beamSrc).getCentroid
+        val targ = battleModel.shipBlockGeom(beamTarg).getCentroid
+        val line = mkLine(src, targ)
+        val hit = (line intersection battleModel.shipBlockGeom(battleModel.beamHits(beamSrc))).asInstanceOf[geom.LineString].getPointN(0) // todo, choose closer point
+        val realLine = mkLine(src, hit)
+
+        val lineToDraw = toAwtShape(scaleModelToView(realLine))
 
         val c = beam.color
         val outline = new Color(c.getRed, c.getBlue, c.getBlue, 150)
@@ -324,9 +336,17 @@ object App extends scala.swing.SwingApplication {
       if (selectionPath != null)
         draw(color = Color.WHITE, shape = selectionPath)
 
-      // draw tooltip
-      if (hover != null)
-        drawTooltip(g, ""+hover, mousePoint, true)
+      // draw hover tooltip
+      hoverOverPoint(scaleViewToModel(awtPointToJts(mousePoint))) match {
+        case Some((sh, blpos)) =>
+          val block = battleModel.ships(sh).ship.blocks(blpos)
+          drawTooltip(g, ""+block, mousePoint, true)
+        case _ =>
+      }
+
+      // draw speed and paused state
+      val timeMsg = "speed: " + speed + (if (paused) " paused" else "")
+      drawTooltip(g, timeMsg, new Point(10, 10))
 
       // draw destanation of ships
       for ((shipIdx, (pos, rot)) <- battleModel.movementDirections) {
@@ -334,11 +354,10 @@ object App extends scala.swing.SwingApplication {
         drawCrosshair(g, _pos)
         draw(color = Color.GREEN, shape = toAwtShape(scaleModelToView(mkLine(battleModel.ships(shipIdx).pos, pos))))
         draw(color = Color.GREEN, shape = toAwtShape(scaleModelToView(mkLine(pos, moveInDir(pos, 20, rot)))))
-        drawTooltip(g, ""+pos+" "+rot, _pos)
+        //drawTooltip(g, ""+pos+" "+rot, _pos)
       }
     }
   }
-
 
 //    contents = new BorderPanel {
 //      layout += (shipPanel -> BorderPanel.Position.Center)

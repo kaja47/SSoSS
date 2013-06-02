@@ -10,11 +10,11 @@ import com.vividsolutions.jts.algorithm.Angle
 case class ShipInBattle(ship: SpaceShip, pos: geom.Point, rot: Double/*, destPos: geom.Point, destRot: geom.Point*/) {
   private def baseGeom: Map[(Int, Int), geom.Geometry] =
     ship.blocks map { case (p @ (x, y), bl) =>
-      val (comx, comy) = ship.centerOfMass
+      //val (comx, comy) = ship.centerOfMass
 
       // absolute offsets from `pos` (centerOfMass)
-      val xoff = (x - comx) * blockSize
-      val yoff = (y - comy) * blockSize
+      val xoff = (x/* - comx*/) * blockSize
+      val yoff = (y/* - comy*/) * blockSize
 
       val xpos = pos.getX + xoff
       val ypos = pos.getY + yoff
@@ -36,6 +36,23 @@ case class BattleModel(
     targeting: Map[(Int, (Int, Int)), (Int, (Int, Int))] = Map(),
     movementDirections: Map[Int, (geom.Point, Double)] = Map()
 ) {
+
+  lazy val beamHits: Map[(Int, (Int, Int)), (Int, (Int, Int))] = 
+    targeting map { case (src, dest) => (src, collideWith(src, dest)) }
+
+  def collideWith(source: (Int, (Int, Int)), target: (Int, (Int, Int))): (Int, (Int, Int)) = {
+    val beam = beamLine(source, target)
+
+    val collisions = for {
+      (sib, shipIdx) <- ships.zipWithIndex
+      (blpos, blGeom) <- sib.blockGeom.toSeq
+      if (shipIdx, blpos) != source // beam cannot damage it's own source block
+      if beam crosses blGeom
+    } yield (shipIdx, blpos)
+
+    collisions minBy { targ => beamDist(source, targ) }
+  }
+
   def withTargeting(source: (Int, (Int, Int)), target: (Int, (Int, Int))): BattleModel =
     if (!canTarget(source, target)) this else copy(targeting = targeting + ((source, target)))
 
@@ -49,29 +66,75 @@ case class BattleModel(
     copy(movementDirections = movementDirections + ((shipIdx, (dest, rot))))
   }
 
-  def blockRotGeom(block: (Int, (Int, Int))) = ships(block._1).blockGeom(block._2)
+  def shipBlockGeom(block: (Int, (Int, Int))) = ships(block._1).blockGeom(block._2)
+  def shipBlock(block: (Int, (Int, Int))) = ships(block._1).ship.blocks(block._2)
 
-  def tick(time: Int): BattleModel = {
+  /**
+   * @param time - time in seconds (time between frames multiplied by game speed)
+   */
+  def tick(time: Double): BattleModel = {
 
-    val _ships = ships.zipWithIndex map { case (shipInBattle, idx) =>
-      if (movementDirections contains idx) {
+    // update of ships in battle
+    val _ships = ships.zipWithIndex map { case (sib, idx) => // sib = shipInBattle
+
+      // movement and rotation
+      val (_pos, _rot) = if (movementDirections contains idx) {
         val (moveDest, rotDest) = movementDirections(idx)
-        shipInBattle copy (
-          pos = move(shipInBattle.pos, moveDest, 1),
-          rot = rot(shipInBattle.rot, rotDest, 0.02)
-        )
-      } else shipInBattle
+        val moveDist = sib.ship.travelSpeed * time
+        val rotAngle = sib.ship.turnSpeed   * time
+        (move(sib.pos, moveDest, moveDist), rot(sib.rot, rotDest, rotAngle))
+      } else (sib.pos, sib.rot)
+
+      // beam damage
+      val targetedBy: Map[(Int, Int), Double] = beamHits.toSeq collect {
+        case (src @ (srcShipIdx, srcBlockPos), targ @ (`idx`, targBlockPos)) =>
+          val srcBeam = ships(srcShipIdx).ship.derivedInstallations(srcBlockPos).asInstanceOf[Beam]
+          (targBlockPos, srcBeam.damagePerSecAtDistance(beamDist(src, targ)))
+      } groupBy (_._1) mapValues { vs => vs map (_._2) sum }
+
+      val _ship = sib.ship.copy(
+        blocks = sib.ship.blocks.map {
+          case (blpos, bl) if targetedBy contains blpos =>
+            //println(targetedBy(blpos) * time)
+            blpos -> bl.copy(
+              damage = bl.damage + (targetedBy(blpos) * time)
+            )
+          case p => p
+        } filter { case (blpos, bl) => bl.durability > bl.damage }
+      )
+
+      // temperature
+
+      sib copy (
+        pos  = _pos,
+        rot  = _rot,
+        ship = _ship
+      )
     }
 
-    copy (
-      ships     = _ships,
-      targeting = targeting filter { case (src, targ) => canTarget(src, targ) }
+    val updated = copy (
+      ships     = _ships
+    ) 
+
+    updated copy (
+      targeting = updated.targeting filter { case (src, targ) => updated.canTarget(src, targ) }
     )
   }
 
-  private def canTarget(source: (Int, (Int, Int)), target: (Int, (Int, Int))) = {
-    val start = blockRotGeom(source).getCentroid
-    val end   = blockRotGeom(target).getCentroid
+  private def beamLine(source: (Int, (Int, Int)), target: (Int, (Int, Int))) =
+    mkLine(shipBlockGeom(source).getCentroid, shipBlockGeom(target).getCentroid)
+
+  private def beamDist(source: (Int, (Int, Int)), target: (Int, (Int, Int))) =
+    shipBlockGeom(source).getCentroid distance shipBlockGeom(target).getCentroid
+
+  private def canTarget(source: (Int, (Int, Int)), target: (Int, (Int, Int))): Boolean = {
+    val sourceExists = ships.isDefinedAt(source._1) && ships(source._1).ship.blocks.contains(source._2)
+    val targetExists = ships.isDefinedAt(target._1) && ships(target._1).ship.blocks.contains(target._2)
+
+    if (!sourceExists || !targetExists) return false
+
+    val start = shipBlockGeom(source).getCentroid
+    val end   = shipBlockGeom(target).getCentroid
     val line = mkLine(start, end)
 
     val targetItself = source._1 == target._1
@@ -79,7 +142,7 @@ case class BattleModel(
     val bls = ships(source._1).blockGeom - source._2 values
     val collideWithItself = bls exists { bl => line crosses bl }
 
-    val isBeamInRange = ships(source._1).ship.blocks(source._2).installation match {
+    val isBeamInRange = ships(source._1).ship.derivedInstallations(source._2) match {
       case b: Beam if (start distance end) <= b.range => true
       case _ => false
     }

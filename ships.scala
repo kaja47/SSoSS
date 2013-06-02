@@ -6,13 +6,13 @@ import Game._
 import java.awt.Color
 
 
-case class SpaceShip(
+final case class SpaceShip(
     blocks: Blocks,
     storageManifest: StorageManifest = StorageManifest(0, 0, 0)
 ) {
-  def block(x: Int, y: Int) = blocks((x, y))
+  //def block(x: Int, y: Int) = blocks((x, y))
 
-  // first apply modifications by local state of block and the
+  // first apply modifications by local state of block and then by state of whole (derived) ship
   def derivedInstallations: Map[(Int, Int), Installation] = {
     val derivedBlocks = blocks mapValues { block => block copy (installation = block.installation.derive(block)) }
     derivedBlocks map { case (pos, block) => pos -> block.installation.derive(pos, derivedBlocks) }
@@ -36,12 +36,14 @@ case class SpaceShip(
     val m = mass
     if (m == 0) (0, 0) else (sx / mass, sy / mass)
   }
-  def hasEngine   = installations[Engine] nonEmpty
-  def travelSpeed = if (hasEngine) installations[Engine, Int](_.power).sum / mass else 0
-  def turnSpeed   = travelSpeed // for now
+  def hasEngine       = installations[Engine] nonEmpty
+  /** speed in units per second */
+  def travelSpeed     = if (hasEngine) installations[Engine, Double](_.power).sum / mass else 0
+  /** speed in radians per second */
+  def turnSpeed       = travelSpeed // for now
   def storageCapacity = installations[Storage, Int](_.capacity) sum
-  def energyOutput = installations[ProduceEnergy, Int](_.energyOutput) sum
-  def energyInput  = installations[ConsumeEnergy, Int](_.energyInput) sum
+  def energyOutput    = installations[ProduceEnergy, Double](_.energyOutput) sum
+  def energyInput     = installations[ConsumeEnergy, Double](_.energyInput) sum
 
   /** check is ship is one compact object */
   def isCompact = {
@@ -75,7 +77,7 @@ isCompact: $isCompact
 }
 
 
-case class StorageManifest(minerals: Int, fuel: Int, parts: Int)
+final case class StorageManifest(minerals: Int, fuel: Int, parts: Int)
 
 sealed trait PhysicalProperties {
   def mass: Int
@@ -83,13 +85,13 @@ sealed trait PhysicalProperties {
 }
 
 
-case class Block(
+final case class Block(
   material: Material,
   installation: Installation,
 
-  damage: Int        = 0,
-  overcharge: Double = 1.0,
-  temperature: Int   = 0
+  damage: Double      = 0.0,
+  overcharge: Double  = 1.0,
+  temperature: Double = 0.0
 ) extends PhysicalProperties {
   def mass       = material.mass       + installation.mass
   def durability = material.durability + installation.durability
@@ -100,7 +102,7 @@ case class Block(
 }
 
 
-case class Material(name: String, mass: Int, durability: Int) extends PhysicalProperties
+final case class Material(name: String, mass: Int, durability: Int) extends PhysicalProperties
 object Material {
   val skeleton  = Material("skeleton",  100,  100)
   val titanium  = Material("titanium",  250,  800)
@@ -119,62 +121,81 @@ sealed trait Installation extends PhysicalProperties {
   def in(material: Material) = Block(material = material, installation = this)
 }
 
-sealed trait ProduceEnergy extends Installation { def energyOutput: Int }
-sealed trait ConsumeEnergy extends Installation { def energyInput: Int }
+sealed trait ProduceEnergy extends Installation { def energyOutput: Double }
+sealed trait ConsumeEnergy extends Installation { def energyInput: Double }
 
 
 case object NoInstallation extends Installation { val mass = 0; val durability = 0 }
 
-case class PilotCapsule() extends Installation {
+final case class PilotCapsule() extends Installation {
   val mass = 100
   val durability = 1000
 }
-case class EnergyCore(energyOutput: Int) extends Installation with ProduceEnergy {
+final case class EnergyCore(energyOutput: Double) extends Installation with ProduceEnergy {
   val mass = 100
   val durability = 100
   override def derive(block: Block): EnergyCore = copy(
-    energyOutput = 1.0 * energyOutput * (1.0 - block.damage / block.durability) toInt
+    energyOutput = 1.0 * energyOutput * (1.0 - block.damage / block.durability)
   )
   override def derive(pos: (Int, Int), blocks: Blocks): EnergyCore = {
     val bonus = 1.0 + (for {
       n <- neighboursOf(pos)
       Block(_, e: EnergyCore, _, _, _) <- blocks.get(n)
     } yield 0.1).sum
-    copy(energyOutput = energyOutput * bonus toInt)
+    copy(energyOutput = energyOutput * bonus)
   }
 }
-case class Engine(energyInput: Int, power: Int) extends Installation with ConsumeEnergy {
+final case class Engine(energyInput: Double, power: Double) extends Installation with ConsumeEnergy {
   val mass = 100
   val durability = 500;
   override def derive(block: Block): Engine = copy(
-    energyInput = 1.0 * energyInput * block.overcharge toInt,
-    power       = 1.0 * power * (1.0 - block.damage / block.durability) * block.overcharge toInt
+    energyInput = 1.0 * energyInput * block.overcharge,
+    power       = 1.0 * power * (1.0 - block.damage / block.durability) * block.overcharge
   )
 }
-case class Storage     (capacity: Int)                extends Installation { val mass = 100; val durability = 100 }
-case class Beam(
+final case class Storage     (capacity: Int)                extends Installation { val mass = 100; val durability = 100 }
+final case class Beam(
+  name: String,
   mass: Int,
   durability: Int,
-  damagePerSec: Int,
-  energyInput: Int,
+  damagePerSec: Double,
+  // + impactHeat
+  energyInput: Double,
   range: Double,
-  dissipation: Double, // damage is inversly linearlly proportional to range, dissiapation is ratio of damage caused by beam on the very end of it's range
+  dissipation: Double, // damage is inversly linearly proportional to range, dissipation is ratio of beam damage lost on the very end of weapon range
   overchargeEfficiency: Double,
-  criticalTemperature: Int,
+  criticalTemperature: Double,
   color: Color
   // beamCount
 ) extends Installation with ConsumeEnergy {
+  def damagePerSecAtDistance(dist: Double) = damagePerSec * (1.0 - (dissipation * (dist / range)))
+
   override def derive(block: Block): Beam = copy(
     damagePerSec = 1.0 * damagePerSec *
       (1.0 - block.damage / block.durability) *
-      math.min(block.temperature, criticalTemperature) / block.temperature *
-      (if (block.overcharge > 1) 1 + (block.overcharge - 1) * overchargeEfficiency else block.overcharge ) toInt,
-    energyInput  = 1.0 * energyInput * block.overcharge toInt
+      (if (block.temperature == 0) 1.0 else math.min(block.temperature, criticalTemperature) / block.temperature) *
+      (if (block.overcharge > 1) 1 + (block.overcharge - 1) * overchargeEfficiency else block.overcharge),
+    energyInput  = 1.0 * energyInput * block.overcharge
   )
 }
 
 object Beam {
-  val laser  = Beam(mass = 100, durability = 100, damagePerSec = 600, energyInput = 500, range = 500, dissipation = 0.8,  overchargeEfficiency = 0.5, criticalTemperature = 1000, color = Color.RED)
-  val phaser = Beam(mass = 200, durability = 100, damagePerSec = 900, energyInput = 500, range = 400, dissipation = 0.6,  overchargeEfficiency = 0.5, criticalTemperature = 1000, color = Color.ORANGE)
-  val gauss  = Beam(mass = 400, durability = 100, damagePerSec = 600, energyInput = 500, range = 800, dissipation = 0.95, overchargeEfficiency = 0.5, criticalTemperature = 1000, color = Color.GRAY)
+  val laser  = Beam("Laser Cannon", mass = 100, durability = 100, damagePerSec = 120, energyInput = 500, range = 1500, dissipation = 0.2,  overchargeEfficiency = 0.5, criticalTemperature = 1000, color = Color.RED)
+  val phaser = Beam("Fusion Beam",  mass = 200, durability = 100, damagePerSec = 180, energyInput = 700, range = 1200, dissipation = 0.4,  overchargeEfficiency = 0.5, criticalTemperature = 1000, color = Color.ORANGE)
+  val gauss  = Beam("Gauss Cannon", mass = 400, durability = 100, damagePerSec = 120, energyInput = 900, range = 2400, dissipation = 0.05, overchargeEfficiency = 0.5, criticalTemperature = 1000, color = Color.GRAY)
+
+/*
+Neutron Blaster
+Graviton Beam
+Phasor
+Plasma Cannon
+Mauler Device
+
+Mass Driver
+Gauss Cannon
+
+Ion Pulse Cannon
+*/
+
+
 }
